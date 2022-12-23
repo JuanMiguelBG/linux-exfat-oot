@@ -62,7 +62,7 @@ static void exfat_get_uniname_from_ext_entry(struct super_block *sb,
 /* read a directory entry from the opened directory */
 static int exfat_readdir(struct inode *inode, loff_t *cpos, struct exfat_dir_entry *dir_entry)
 {
-	int i, dentries_per_clu, dentries_per_clu_bits = 0, num_ext;
+	int i, dentries_per_clu, num_ext;
 	unsigned int type, clu_offset, max_dentries;
 	struct exfat_chain dir, clu;
 	struct exfat_uni_name uni_name;
@@ -84,11 +84,10 @@ static int exfat_readdir(struct inode *inode, loff_t *cpos, struct exfat_dir_ent
 			EXFAT_B_TO_CLU(i_size_read(inode), sbi), ei->flags);
 
 	dentries_per_clu = sbi->dentries_per_clu;
-	dentries_per_clu_bits = ilog2(dentries_per_clu);
 	max_dentries = (unsigned int)min_t(u64, MAX_EXFAT_DENTRIES,
-					   (u64)sbi->num_clusters << dentries_per_clu_bits);
+				(u64)EXFAT_CLU_TO_DEN(sbi->num_clusters, sbi));
 
-	clu_offset = dentry >> dentries_per_clu_bits;
+	clu_offset = EXFAT_DEN_TO_CLU(dentry, sbi);
 	exfat_chain_dup(&clu, &dir);
 
 	if (clu.flags == ALLOC_NO_FAT_CHAIN) {
@@ -163,7 +162,7 @@ static int exfat_readdir(struct inode *inode, loff_t *cpos, struct exfat_dir_ent
 			dir_entry->entry = dentry;
 			brelse(bh);
 
-			ei->hint_bmap.off = dentry >> dentries_per_clu_bits;
+			ei->hint_bmap.off = EXFAT_DEN_TO_CLU(dentry, sbi);
 			ei->hint_bmap.clu = clu.dir;
 
 			*cpos = EXFAT_DEN_TO_B(dentry + 1 + num_ext);
@@ -830,7 +829,7 @@ int exfat_get_dentry_set(struct exfat_entry_set_cache *es,
 		unsigned int type)
 {
 	int ret, i, num_bh;
-	unsigned int off, byte_offset, clu = 0;
+	unsigned int off;
 	sector_t sec;
 	struct exfat_sb_info *sbi = EXFAT_SB(sb);
 	struct exfat_dentry *ep;
@@ -843,26 +842,15 @@ int exfat_get_dentry_set(struct exfat_entry_set_cache *es,
 		return -EIO;
 	}
 
-	byte_offset = EXFAT_DEN_TO_B(entry);
-	ret = exfat_walk_fat_chain(sb, p_dir, byte_offset, &clu);
+	ret = exfat_find_location(sb, p_dir, entry, &sec, &off);
 	if (ret)
 		return ret;
 
 	memset(es, 0, sizeof(*es));
 	es->sb = sb;
 	es->modified = false;
-
-	/* byte offset in cluster */
-	byte_offset = EXFAT_CLU_OFFSET(byte_offset, sbi);
-
-	/* byte offset in sector */
-	off = EXFAT_BLK_OFFSET(byte_offset, sb);
 	es->start_off = off;
 	es->bh = es->__bh;
-
-	/* sector offset in cluster */
-	sec = EXFAT_B_TO_BLK(byte_offset, sb);
-	sec += exfat_cluster_to_sector(sbi, clu);
 
 	bh = sb_bread(sb, sec);
 	if (!bh)
@@ -890,6 +878,8 @@ int exfat_get_dentry_set(struct exfat_entry_set_cache *es,
 	for (i = 1; i < num_bh; i++) {
 		/* get the next sector */
 		if (exfat_is_last_sector_in_cluster(sbi, sec)) {
+			unsigned int clu = exfat_sector_to_cluster(sbi, sec);
+
 			if (p_dir->flags == ALLOC_NO_FAT_CHAIN)
 				clu++;
 			else if (exfat_get_next_cluster(sb, &clu))
@@ -968,7 +958,7 @@ enum {
  */
 int exfat_find_dir_entry(struct super_block *sb, struct exfat_inode_info *ei,
 		struct exfat_chain *p_dir, struct exfat_uni_name *p_uniname,
-		int num_entries, unsigned int type, struct exfat_hint *hint_opt)
+		struct exfat_hint *hint_opt)
 {
 	int i, rewind = 0, dentry = 0, end_eidx = 0, num_ext = 0, len;
 	int order, step, name_len = 0;
@@ -979,6 +969,10 @@ int exfat_find_dir_entry(struct super_block *sb, struct exfat_inode_info *ei,
 	struct exfat_hint *hint_stat = &ei->hint_stat;
 	struct exfat_hint_femp candi_empty;
 	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	int num_entries = exfat_calc_num_entries(p_uniname);
+
+	if (num_entries < 0)
+		return num_entries;
 
 	dentries_per_clu = sbi->dentries_per_clu;
 
@@ -1032,10 +1026,8 @@ rewind:
 				step = DIRENT_STEP_FILE;
 				hint_opt->clu = clu.dir;
 				hint_opt->eidx = i;
-				if (type == TYPE_ALL || type == entry_type) {
-					num_ext = ep->dentry.file.num_ext;
-					step = DIRENT_STEP_STRM;
-				}
+				num_ext = ep->dentry.file.num_ext;
+				step = DIRENT_STEP_STRM;
 				brelse(bh);
 				continue;
 			}
